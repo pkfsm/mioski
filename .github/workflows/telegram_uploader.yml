@@ -1,4 +1,4 @@
-name: edia Uploader
+name: Telegram Media Uploader
 
 on:
   workflow_dispatch:
@@ -14,8 +14,8 @@ on:
         default: ''
         type: string
   # schedule:
-  #   # Run daily at 12:00 UTC (optional)
-  #   - cron: '0 12 * * *'
+    # Run daily at 12:00 UTC (optional)
+    # - cron: '0  * * *'
 
 jobs:
   upload:
@@ -48,7 +48,7 @@ jobs:
 
     - name: Upload downloaded JSON (for debugging)
       if: always()
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: media-data-json
         path: media_data.json
@@ -56,7 +56,7 @@ jobs:
 
     - name: Upload logs (if failed)
       if: failure()
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: upload-logs
         path: |
