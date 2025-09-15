@@ -1,4 +1,4 @@
-name: Telegram Media Uploader
+name: edia Uploader
 
 on:
   workflow_dispatch:
@@ -13,9 +13,9 @@ on:
         required: false
         default: ''
         type: string
-  schedule:
-    # Run daily at 12:00 UTC (optional)
-    - cron: '0 12 * * *'
+  # schedule:
+  #   # Run daily at 12:00 UTC (optional)
+  #   - cron: '0 12 * * *'
 
 jobs:
   upload:
