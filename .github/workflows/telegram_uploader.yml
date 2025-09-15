@@ -1,4 +1,4 @@
-name: Telegram Media Uploader
+name: Media Uploader
 
 on:
   workflow_dispatch:
