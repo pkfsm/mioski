@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 API_ID = int(os.getenv('API_ID'))
 API_HASH = os.getenv('API_HASH')
 SESSION_STRING = os.getenv('SESSION_STRING')
-GROUP_ID = int(os.getenv('GROUP_ID'))  # Your target group ID
+GROUP_ID = "@filexshit"  # Your target group ID
 START_FROM_ID = int(os.getenv('START_FROM_ID', '0'))  # Start uploading from this ID
 GOOGLE_DRIVE_JSON_URL = os.getenv('GOOGLE_DRIVE_JSON_URL')  # Google Drive direct download link
 
