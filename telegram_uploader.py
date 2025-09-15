@@ -5,12 +5,14 @@ import tempfile
 import requests
 from pyrogram import Client
 from pyrogram.types import InputMediaVideo
+from pyrogram.enums import ParseMode
 from PIL import Image
 import logging
 from urllib.parse import urlparse
 import aiohttp
 import aiofiles
 import math
+from aiohttp import ClientError, ClientTimeout, ContentTypeError
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -26,6 +28,7 @@ GOOGLE_DRIVE_JSON_URL = os.getenv('GOOGLE_DRIVE_JSON_URL')  # Google Drive direc
 MAX_FILE_SIZE = int(os.getenv('MAX_FILE_SIZE', '1900000000'))  # 1.9GB for splitting
 TELEGRAM_LIMIT = int(os.getenv('TELEGRAM_LIMIT', '2000000000'))  # 2GB Telegram absolute limit
 DOWNLOAD_TIMEOUT = int(os.getenv('DOWNLOAD_TIMEOUT', '3600'))  # 1 hour timeout
+MAX_RETRIES = int(os.getenv('MAX_RETRIES', '3'))  # Number of download retries
 
 def convert_google_drive_url(url):
     """Convert Google Drive sharing URL to direct download URL"""
@@ -67,24 +70,38 @@ async def download_json_data():
         logger.error(f"Error loading JSON data: {e}")
         raise
 
-async def get_file_size(url):
+async def get_file_size(url, session=None):
     """Get file size from URL without downloading"""
+    close_session = False
+    if session is None:
+        session = aiohttp.ClientSession()
+        close_session = True
+
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.head(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
-                if response.status == 200:
-                    size = response.headers.get('content-length')
-                    return int(size) if size else 0
+        timeout = ClientTimeout(total=30, connect=10)
+        async with session.head(url, timeout=timeout, allow_redirects=True) as response:
+            if response.status == 200:
+                size = response.headers.get('content-length')
+                return int(size) if size else 0
+            else:
+                logger.warning(f"HEAD request failed with status {response.status} for {url}")
                 return 0
     except Exception as e:
         logger.warning(f"Could not get file size for {url}: {e}")
         return 0
+    finally:
+        if close_session:
+            await session.close()
 
 def get_clean_filename(name, url):
     """Generate clean filename from name and URL"""
     # Clean the name for filename use
-    clean_name = "".join(c for c in name if c.isalnum() or c in (' ', '-', '_')).strip()
+    clean_name = "".join(c for c in name if c.isalnum() or c in (' ', '-', '_', '(', ')')).strip()
     clean_name = clean_name.replace(' ', '_')
+
+    # Limit filename length
+    if len(clean_name) > 50:
+        clean_name = clean_name[:50]
 
     # Get extension from URL
     parsed_url = urlparse(url)
@@ -92,6 +109,125 @@ def get_clean_filename(name, url):
     extension = os.path.splitext(original_filename)[1] or '.mp4'
 
     return f"{clean_name}{extension}"
+
+async def download_with_resume(session, url, file_path, start_byte=0):
+    """Download file with resume capability"""
+    headers = {}
+    if start_byte > 0:
+        headers['Range'] = f'bytes={start_byte}-'
+        logger.info(f"Resuming download from byte {start_byte}")
+
+    timeout = ClientTimeout(total=DOWNLOAD_TIMEOUT, sock_read=300)  # 5 min read timeout
+
+    try:
+        async with session.get(url, headers=headers, timeout=timeout) as response:
+            if response.status not in [200, 206]:  # 206 for partial content
+                logger.error(f"HTTP {response.status} for {url}")
+                return False
+
+            # Open file in append mode if resuming
+            mode = 'ab' if start_byte > 0 else 'wb'
+            async with aiofiles.open(file_path, mode) as f:
+                downloaded = start_byte
+                chunk_size = 8192
+
+                async for chunk in response.content.iter_chunked(chunk_size):
+                    await f.write(chunk)
+                    downloaded += len(chunk)
+
+                    # Log progress every 10MB
+                    if downloaded % (10 * 1024 * 1024) == 0:
+                        logger.info(f"Downloaded: {downloaded / 1024 / 1024:.1f} MB")
+
+                return True
+
+    except asyncio.TimeoutError:
+        logger.error("Download timeout occurred")
+        return False
+    except ClientError as e:
+        logger.error(f"Client error during download: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error during download: {e}")
+        return False
+
+async def download_file(url, filename):
+    """Download file from URL with retry logic and resume capability"""
+    logger.info(f"Starting download: {filename}")
+
+    # Create temporary file
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1])
+    temp_path = temp_file.name
+    temp_file.close()
+
+    connector = aiohttp.TCPConnector(
+        limit=10,
+        ttl_dns_cache=300,
+        use_dns_cache=True,
+        keepalive_timeout=30,
+        enable_cleanup_closed=True
+    )
+
+    async with aiohttp.ClientSession(connector=connector) as session:
+        # Check file size first
+        file_size = await get_file_size(url, session)
+        if file_size > TELEGRAM_LIMIT * 10:  # Don't download extremely large files (>20GB)
+            logger.error(f"File too large to process: {file_size / 1024 / 1024 / 1024:.1f} GB")
+            try:
+                os.unlink(temp_path)
+            except:
+                pass
+            return None
+
+        if file_size > 0:
+            logger.info(f"File size: {file_size / 1024 / 1024:.1f} MB")
+
+        # Retry logic
+        for attempt in range(MAX_RETRIES):
+            try:
+                logger.info(f"Download attempt {attempt + 1}/{MAX_RETRIES}")
+
+                # Check if partial file exists
+                start_byte = 0
+                if os.path.exists(temp_path) and attempt > 0:
+                    start_byte = os.path.getsize(temp_path)
+                    if start_byte > 0:
+                        logger.info(f"Found partial download, resuming from {start_byte / 1024 / 1024:.1f} MB")
+
+                # Attempt download
+                success = await download_with_resume(session, url, temp_path, start_byte)
+
+                if success:
+                    final_size = os.path.getsize(temp_path)
+                    logger.info(f"Download completed: {filename} ({final_size / 1024 / 1024:.1f} MB)")
+
+                    # Verify file size if we know the expected size
+                    if file_size > 0 and abs(final_size - file_size) > 1024:  # Allow 1KB difference
+                        logger.warning(f"File size mismatch: expected {file_size}, got {final_size}")
+                        if attempt < MAX_RETRIES - 1:
+                            logger.info("Retrying download due to size mismatch")
+                            continue
+
+                    return temp_path
+                else:
+                    logger.warning(f"Download attempt {attempt + 1} failed")
+
+            except Exception as e:
+                logger.error(f"Download attempt {attempt + 1} failed with error: {e}")
+
+            # Wait before retry (exponential backoff)
+            if attempt < MAX_RETRIES - 1:
+                wait_time = 2 ** attempt  # 1, 2, 4 seconds
+                logger.info(f"Waiting {wait_time} seconds before retry...")
+                await asyncio.sleep(wait_time)
+
+        # All attempts failed
+        logger.error(f"All download attempts failed for {filename}")
+        try:
+            os.unlink(temp_path)
+        except:
+            pass
+        return None
 
 async def split_file(file_path, chunk_size):
     """Split large file into smaller chunks"""
@@ -133,58 +269,6 @@ async def split_file(file_path, chunk_size):
         logger.error(f"Error splitting file: {e}")
         return []
 
-async def download_file(url, filename):
-    """Download file from URL with progress tracking"""
-    try:
-        logger.info(f"Starting download: {filename}")
-
-        # Check file size first
-        file_size = await get_file_size(url)
-        if file_size > TELEGRAM_LIMIT * 10:  # Don't download extremely large files (>20GB)
-            logger.error(f"File too large to process: {file_size / 1024 / 1024 / 1024:.1f} GB")
-            return None
-
-        if file_size > 0:
-            logger.info(f"File size: {file_size / 1024 / 1024:.1f} MB")
-
-        async with aiohttp.ClientSession() as session:
-            timeout = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)
-            async with session.get(url, timeout=timeout) as response:
-                if response.status != 200:
-                    logger.error(f"HTTP {response.status} for {url}")
-                    return None
-
-                # Create temporary file
-                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1])
-                temp_path = temp_file.name
-                temp_file.close()
-
-                # Download with progress
-                downloaded = 0
-                last_logged_mb = 0
-                async with aiofiles.open(temp_path, 'wb') as f:
-                    async for chunk in response.content.iter_chunked(8192):
-                        await f.write(chunk)
-                        downloaded += len(chunk)
-                        current_mb = downloaded // (1024 * 1024)
-                        if current_mb > last_logged_mb and current_mb % 10 == 0:  # Log every 10MB
-                            if file_size > 0:
-                                progress = (downloaded / file_size) * 100
-                                logger.info(f"Download progress: {progress:.1f}% ({current_mb} MB)")
-                            else:
-                                logger.info(f"Downloaded: {current_mb} MB")
-                            last_logged_mb = current_mb
-
-                logger.info(f"Download completed: {filename} ({downloaded / 1024 / 1024:.1f} MB)")
-                return temp_path
-
-    except asyncio.TimeoutError:
-        logger.error(f"Download timeout for {filename}")
-        return None
-    except Exception as e:
-        logger.error(f"Download failed for {filename}: {e}")
-        return None
-
 async def download_thumbnail(url):
     """Download and prepare thumbnail image"""
     try:
@@ -211,6 +295,16 @@ async def download_thumbnail(url):
         logger.error(f"Failed to download thumbnail from {url}: {e}")
         return None
 
+def escape_markdown(text):
+    """Escape special characters for Telegram MarkdownV2"""
+    # Characters that need to be escaped in MarkdownV2
+    escape_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+
+    for char in escape_chars:
+        text = text.replace(char, f'\\{char}')
+
+    return text
+
 async def upload_video_to_telegram(client, video_path, caption, thumbnail_path=None, part_info=None):
     """Upload video file to Telegram"""
     try:
@@ -222,19 +316,67 @@ async def upload_video_to_telegram(client, video_path, caption, thumbnail_path=N
         if part_info:
             caption += f"\n\n📦 **Part {part_info['current']}/{part_info['total']}**"
 
-        # Upload video
-        message = await client.send_video(
-            chat_id=GROUP_ID,
-            video=video_path,
-            thumb=thumbnail_path,
-            caption=caption,
-            parse_mode="markdown",
-            supports_streaming=True,
-            progress=upload_progress
-        )
+        # Try with MarkdownV2 first, then fall back to HTML, then plain text
+        upload_success = False
 
-        logger.info(f"Successfully uploaded video to Telegram")
-        return True
+        # Try MarkdownV2 (requires escaping)
+        try:
+            escaped_caption = escape_markdown(caption)
+            message = await client.send_video(
+                chat_id=GROUP_ID,
+                video=video_path,
+                thumb=thumbnail_path,
+                caption=escaped_caption,
+                parse_mode=ParseMode.MARKDOWN,
+                supports_streaming=True,
+                progress=upload_progress
+            )
+            upload_success = True
+            logger.info("Successfully uploaded with MarkdownV2 formatting")
+        except Exception as md_error:
+            logger.warning(f"MarkdownV2 upload failed: {md_error}")
+
+            # Try HTML formatting
+            try:
+                html_caption = caption.replace('**', '<b>').replace('**', '</b>')
+                html_caption = html_caption.replace('`', '<code>').replace('`', '</code>')
+
+                message = await client.send_video(
+                    chat_id=GROUP_ID,
+                    video=video_path,
+                    thumb=thumbnail_path,
+                    caption=html_caption,
+                    parse_mode=ParseMode.HTML,
+                    supports_streaming=True,
+                    progress=upload_progress
+                )
+                upload_success = True
+                logger.info("Successfully uploaded with HTML formatting")
+            except Exception as html_error:
+                logger.warning(f"HTML upload failed: {html_error}")
+
+                # Fall back to plain text
+                try:
+                    plain_caption = caption.replace('**', '').replace('`', '')
+                    message = await client.send_video(
+                        chat_id=GROUP_ID,
+                        video=video_path,
+                        thumb=thumbnail_path,
+                        caption=plain_caption,
+                        supports_streaming=True,
+                        progress=upload_progress
+                    )
+                    upload_success = True
+                    logger.info("Successfully uploaded with plain text formatting")
+                except Exception as plain_error:
+                    logger.error(f"All formatting attempts failed: {plain_error}")
+
+        if upload_success:
+            logger.info(f"Successfully uploaded video to Telegram")
+            return True
+        else:
+            logger.error("Failed to upload with any formatting method")
+            return False
 
     except Exception as e:
         logger.error(f"Failed to upload video to Telegram: {e}")
@@ -291,7 +433,7 @@ async def process_media_entry(client, entry):
                 success_count = 0
                 for i, (part_path, part_filename) in enumerate(split_files, 1):
                     try:
-                        part_caption = f"🎬 **{name}**\n\n📁 File: `{part_filename}`"
+                        part_caption = f"🎬 {name}\n\n📁 File: {part_filename}"
                         part_info = {'current': i, 'total': len(split_files)}
 
                         success = await upload_video_to_telegram(
@@ -321,7 +463,7 @@ async def process_media_entry(client, entry):
 
             else:
                 # File is small enough, upload directly
-                caption = f"🎬 **{name}**\n\n📁 File: `{filename}`"
+                caption = f"🎬 {name}\n\n📁 File: {filename}"
                 return await upload_video_to_telegram(client, video_path, caption, thumbnail_path)
 
         finally:
