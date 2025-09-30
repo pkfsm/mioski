@@ -17,6 +17,8 @@ on:
     # Run daily at 12:00 UTC (optional)
     # - cron: '0  * * *'
 
+  schedule:
+    - cron: '0 */6 * * *'
 jobs:
   upload:
     runs-on: ubuntu-latest
